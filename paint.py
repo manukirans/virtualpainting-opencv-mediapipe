@@ -2,11 +2,12 @@ import cv2
 import mediapipe as mp
 import numpy as np
 import os
+from collections import deque
 from scipy.signal import savgol_filter
 
 # Hand Detection Class
 class HandDetector:
-    def __init__(self, mode=False, max_hands=2, detection_confidence=0.70, tracking_confidence=0.70):
+    def __init__(self, mode=False, max_hands=1, detection_confidence=0.5, tracking_confidence=0.5): #Adjustable 
         self.mode = mode
         self.max_hands = max_hands
         self.detection_confidence = detection_confidence
@@ -17,7 +18,7 @@ class HandDetector:
         self.hands = self.mp_hands.Hands(self.mode, self.max_hands,
                                          int(self.detection_confidence), int(self.tracking_confidence))
         self.mp_draw = mp.solutions.drawing_utils
-        self.tip_ids = [4, 8, 12, 16, 20] # thumb, index, middle, ring, pinky.
+        self.tip_ids = [4, 8, 12, 16, 20]  # thumb, index, middle, ring, pinky.
         self.lm_list = []
 
     # Find Hands in the Frame
@@ -61,6 +62,16 @@ class HandDetector:
                     fingers.append(0)
         return fingers
 
+# Function to apply Savitzky-Golay filter for smoothing
+def smooth_points(points):
+    if len(points) > 10:  # Apply smoothing after collecting enough points
+        x, y = zip(*points)
+        x_smooth = savgol_filter(x, window_length=9, polyorder=3)
+        y_smooth = savgol_filter(y, window_length=9, polyorder=3)
+        return list(zip(x_smooth.astype(int), y_smooth.astype(int)))
+    else:
+        return points
+
 # Main Drawing Application
 def main():
     brush_thickness = 15
@@ -68,7 +79,7 @@ def main():
 
     # Load Header Images for Color Selection
     folder_path = "Headers"
-    overlay_list = [cv2.imread(f'{folder_path}/{imPath}') for imPath in os.listdir(folder_path)]
+    overlay_list = [cv2.imread(os.path.join(folder_path, imPath)) for imPath in os.listdir(folder_path)]
     header = overlay_list[0]
 
     # Default Drawing Color
@@ -80,36 +91,34 @@ def main():
     cap.set(4, 720)   # Set Height
 
     # Initialize Hand Detector
-    detector = HandDetector(detection_confidence=0.85, tracking_confidence=0.85)
+    detector = HandDetector(detection_confidence=0.8, tracking_confidence=0.8) #Adjustable
+
     xp, yp = 0, 0  # Initial pen/eraser position
     drawing = False  
-    img_canvas = np.zeros((720, 1280, 3), np.uint8)  # Canvas for drawing: An empty canvas of the same size as the video frame is initialized. This is a black image where drawings will be made.
-    points = []  # Store drawing points
+    img_canvas = np.zeros((720, 1280, 3), np.uint8)  # Canvas for drawing
+    points = deque(maxlen=512)  # Store drawing points
 
     while True:
         success, img = cap.read()
         if not success:
             break
-        img = cv2.flip(img, 1)
 
-        # Hand Detection
+        img = cv2.flip(img, 1)
         img = detector.find_hands(img)
         lm_list = detector.find_position(img, draw=False)
-        fingers = [] #To store the state of each finger (up or down).
 
         if len(lm_list) != 0:
             x1, y1 = lm_list[8][1:]  # Tip of the index finger
             x2, y2 = lm_list[12][1:]  # Tip of the middle finger
             fingers = detector.fingers_up()
 
-            # Ensure fingers list has the correct length before accessing its elements
             if len(fingers) >= 2:
                 # Selection Mode
                 if fingers[1] and fingers[2]:
                     xp, yp = 0, 0  # Reset previous positions
                     drawing = False
-                    points = []  # Clear points when not drawing
-                    if y1 < 125: 
+                    points.clear()  # Clear points when not drawing
+                    if y1 < 125:
                         # Check for color selection
                         if 40 < x1 < 150:
                             header = overlay_list[0]
@@ -144,35 +153,31 @@ def main():
                     cv2.circle(img, (x1, y1), 15, draw_color, cv2.FILLED)  # Draw circle at fingertip
                     points.append((x1, y1))
 
-                    # Savitzky-Golay Smoothing
-                    if len(points) > 10:  # Wait for a few points before smoothing
-                        window_length = 7  # Adjust this for the level of smoothing
-                        poly_order = 5     # Adjust this for the curve's flexibility
-
-                        x, y = zip(*points)
-                        x_smooth = savgol_filter(x, window_length, poly_order)
-                        y_smooth = savgol_filter(y, window_length, poly_order)
-
-                        points_smooth = list(zip(x_smooth.astype(int), y_smooth.astype(int)))
-                        for i in range(1, len(points_smooth)):
-                            cv2.line(img, points_smooth[i - 1], points_smooth[i], draw_color, 
-                                     brush_thickness if draw_color != (0, 0, 0) else eraser_thickness)
-                            cv2.line(img_canvas, points_smooth[i - 1], points_smooth[i], draw_color, 
-                                     brush_thickness if draw_color != (0, 0, 0) else eraser_thickness)
+                    # Draw the lines with smoothing
+                    for i in range(1, len(points)):
+                        if points[i - 1] is None or points[i] is None:
+                            continue
+                        smoothed_points = smooth_points(points)
+                        cv2.line(img, smoothed_points[i - 1], smoothed_points[i], draw_color,
+                                 brush_thickness if draw_color != (0, 0, 0) else eraser_thickness)
+                        cv2.line(img_canvas, smoothed_points[i - 1], smoothed_points[i], draw_color,
+                                 brush_thickness if draw_color != (0, 0, 0) else eraser_thickness)
 
                     xp, yp = x1, y1  # Update for the next iteration
 
         # Combine the Image and the Canvas
-        img_gray = cv2.cvtColor(img_canvas, cv2.COLOR_BGR2GRAY) # Function is used for image binarization. It converts a grayscale image into a binary image based on a threshold value.
-        _, img_inv = cv2.threshold(img_gray, 50, 255, cv2.THRESH_BINARY_INV) #Pixels with a value greater than 50 are set to 0 (black) and those with a value less than or equal to 50 are set to 255 (white).
+        img_gray = cv2.cvtColor(img_canvas, cv2.COLOR_BGR2GRAY)
+        _, img_inv = cv2.threshold(img_gray, 50, 255, cv2.THRESH_BINARY_INV)
         img_inv = cv2.cvtColor(img_inv, cv2.COLOR_GRAY2BGR)
-        img = cv2.bitwise_and(img, img_inv) # masks out the areas of the current frame where the drawings are present on the canvas.
-        img = cv2.bitwise_or(img, img_canvas) #T operation adds the drawings from img_canvas to the current frame (img).
+        img = cv2.bitwise_and(img, img_inv)
+        img = cv2.bitwise_or(img, img_canvas)
 
         # Add the Header
         img[0:125, 0:1280] = header
 
-        cv2.imshow("Image", img)
+        # Show the Live Video Feed
+        cv2.imshow("Live Feed", img)
+
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
